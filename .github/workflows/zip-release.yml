@@ -1,0 +1,132 @@
+name: zip-release (reusable)
+
+# Zentrales, wiederverwendbares Zip-Release. Zwei Modi:
+#  A) Template zippt selbst -> "paths" angeben (personen-inventar/funkstation/bingo-box).
+#  B) Repo baut die Zips selbst -> "prebuilt-glob" angeben (workbot/arbeitsplatz-werkzeuge).
+# Drei Versionsquellen: tag | file | date. Aufrufer pinnen @v1.
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: 'Optionaler Build-Befehl (bekommt RELEASE_TAG/RELEASE_VERSION als Env). Leer = nichts bauen.'
+        type: string
+        default: ''
+      shell:
+        description: 'Shell fuer build-command: bash | pwsh'
+        type: string
+        default: 'bash'
+      paths:
+        description: 'Modus A: Leerzeichen-getrennte Pfade, die ins Zip kommen.'
+        type: string
+        default: ''
+      zip-name:
+        description: 'Basename des Zips ohne Version. Leer = Repo-Name.'
+        type: string
+        default: ''
+      zip-root:
+        description: 'Oberste Ordner-Ebene im Zip (Lotse-Muster). Leer = flach.'
+        type: string
+        default: ''
+      prebuilt-glob:
+        description: 'Modus B: Glob der fertigen Zips aus build-command (z.B. dist/*.zip).'
+        type: string
+        default: ''
+      version-source:
+        description: 'tag | file | date'
+        type: string
+        default: 'tag'
+      version-file:
+        description: 'Bei version-source=file: Pfad (z.B. VERSION oder app/Workbot.ps1).'
+        type: string
+        default: ''
+      version-pattern:
+        description: 'Bei file: grep -oP-Muster mit \K. Leer/Default = erstes Whitespace-Token.'
+        type: string
+        default: '^\s*\K\S+'
+      release-notes-file:
+        description: 'Pfad zu Release-Notes. Leer = --generate-notes.'
+        type: string
+        default: ''
+      release-title:
+        description: 'Release-Titel. Leer = Tag.'
+        type: string
+        default: ''
+      runner:
+        description: 'JSON: ''"ubuntu-latest"'' oder ''["self-hosted","qnap"]''.'
+        type: string
+        default: '"ubuntu-latest"'
+
+jobs:
+  release:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0        # date-Schema braucht die vorhandenen Tags
+
+      - name: Version bestimmen
+        id: ver
+        shell: bash
+        run: |
+          case '${{ inputs.version-source }}' in
+            tag)
+              [ "$GITHUB_REF_TYPE" = tag ] || { echo '::error::version-source=tag, aber kein Tag-Push'; exit 1; }
+              TAG="$GITHUB_REF_NAME" ;;
+            file)
+              V=$(grep -oP '${{ inputs.version-pattern }}' '${{ inputs.version-file }}' | head -1)
+              [ -n "$V" ] || { echo '::error::Version in ${{ inputs.version-file }} nicht gefunden'; exit 1; }
+              TAG="v$V" ;;
+            date)
+              git fetch --tags --force
+              basis="v$(date +%Y.%m.%d)"; TAG="$basis"; n=2
+              while git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; do TAG="$basis-$n"; n=$((n+1)); done ;;
+            *)
+              echo "::error::Unbekannte version-source: ${{ inputs.version-source }}"; exit 1 ;;
+          esac
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"   >> "$GITHUB_OUTPUT"
+          echo "Fassung: $TAG"
+
+      - name: Bauen
+        if: inputs.build-command != ''
+        shell: ${{ inputs.shell }}
+        env:
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+        run: ${{ inputs.build-command }}
+
+      - name: Zip schnueren (Modus A)
+        if: inputs.prebuilt-glob == ''
+        shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -eu
+          [ -n '${{ inputs.paths }}' ] || { echo '::error::Modus A braucht "paths"'; exit 1; }
+          NAME='${{ inputs.zip-name }}'; [ -n "$NAME" ] || NAME="${GITHUB_REPOSITORY##*/}"
+          ROOT='${{ inputs.zip-root }}'
+          staging="$RUNNER_TEMP/paket"; ziel="$staging/${ROOT:-.}"
+          rm -rf "$staging"; mkdir -p "$ziel" dist
+          cp -r --parents ${{ inputs.paths }} "$ziel/"
+          (cd "$staging" && zip -r "$GITHUB_WORKSPACE/dist/${NAME}-${TAG}.zip" .)
+          echo "--- ${NAME}-${TAG}.zip"; unzip -l "dist/${NAME}-${TAG}.zip"
+
+      - name: Release anlegen
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -eu
+          glob='${{ inputs.prebuilt-glob }}'; [ -n "$glob" ] || glob='dist/*.zip'
+          titel='${{ inputs.release-title }}'; [ -n "$titel" ] || titel="$TAG"
+          notes=(--generate-notes)
+          [ -n '${{ inputs.release-notes-file }}' ] && notes=(--notes-file '${{ inputs.release-notes-file }}')
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            gh release create "$TAG" $glob --title "$titel" "${notes[@]}"
+          else
+            gh release create "$TAG" $glob --target "$GITHUB_SHA" --title "$titel" "${notes[@]}"
+          fi
